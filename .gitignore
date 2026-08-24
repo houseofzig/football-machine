@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+data-loaders/backtest_*.json
+data-loaders/backtest_*.log
+data-loaders/mock_projection_*.json
+data-loaders/mock_projection_*.log

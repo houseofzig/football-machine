@@ -1,0 +1,6 @@
+nflreadpy
+pandas
+polars
+supabase
+requests
+python-dotenv

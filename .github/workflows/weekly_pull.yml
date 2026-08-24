@@ -1,0 +1,47 @@
+name: Weekly NFL data pull
+
+on:
+  schedule:
+    # Tuesday ~11:00 UTC (6-7am ET depending on DST) - day after MNF closes the week out
+    - cron: "0 11 * * 2"
+    # Thursday ~11:00 UTC - reconciliation pass, catches NFL stat corrections
+    - cron: "0 11 * * 4"
+  workflow_dispatch:
+    inputs:
+      pass_label:
+        description: "Label for this manual run"
+        required: false
+        default: "manual"
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: data-loaders
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine pass label from schedule
+        id: label
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "label=${{ inputs.pass_label }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 11 * * 2" ]; then
+            echo "label=tuesday" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=thursday" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run weekly pull
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python run_weekly_pull.py --pass-label "${{ steps.label.outputs.label }}"
