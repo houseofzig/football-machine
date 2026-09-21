@@ -34,9 +34,38 @@ from .matchup import (
     compute_position_efficiency_delta,
     compute_team_volume_delta,
 )
-from .vegas import compute_implied_team_tds
+from .vegas import compute_implied_team_tds, get_schedule_row, implied_team_total
 
 DEFAULT_SCORING = {"format": "PPR", "pass_td_pts": 4, "te_premium": 0}
+
+
+def compute_team_envelope(supabase, team, opponent_team, season, week):
+    """
+    The team-level "envelope" for a week: total offensive plays, rush share
+    of those plays, and the Vegas-implied point total - the same three
+    numbers computed inline (and redundantly, once per player) inside
+    project_player_week, pulled out here so callers writing the team-level
+    envelope table can compute it once per team instead of once per player.
+    """
+    team_attempts = compute_team_attempts_baseline(supabase, team, season, week)
+    if team_attempts.get("pass_attempts") is None:
+        return {"total_plays": None, "run_pct": None, "assumed_points": None}
+
+    vol_delta = compute_team_volume_delta(supabase, opponent_team, season, week)
+    baseline_total_plays = team_attempts["pass_attempts"] + team_attempts["rush_attempts"]
+    baseline_rush_share = team_attempts["rush_attempts"] / baseline_total_plays if baseline_total_plays else 0
+
+    adjusted_total_plays = baseline_total_plays * vol_delta["total_plays_ratio"]
+    adjusted_rush_share = min(1.0, max(0.0, baseline_rush_share * vol_delta["rush_share_ratio"]))
+
+    schedule_row = get_schedule_row(supabase, team, season, week)
+    assumed_points = implied_team_total(schedule_row, team) if schedule_row else None
+
+    return {
+        "total_plays": round(adjusted_total_plays, 2),
+        "run_pct": round(adjusted_rush_share, 4),
+        "assumed_points": round(assumed_points, 2) if assumed_points is not None else None,
+    }
 
 
 def _ppr(receptions, scoring):

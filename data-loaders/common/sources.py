@@ -71,11 +71,30 @@ ESPN_STAT_INDEX = {
 
 
 def get_current_week():
-    """Returns (season, week) per Sleeper's live NFL state endpoint."""
+    """
+    Returns (season, week) - always the current REGULAR season week, never
+    preseason or playoffs. Sleeper's state endpoint reports a raw week number
+    that resets across season phases (season_type: 'pre' weeks 1-4, 'regular'
+    weeks 1-18, 'post' for playoffs) - using that number directly without
+    checking season_type would misread e.g. preseason week 3 as regular
+    season week 3 (confirmed happening: 2026-08-24, Sleeper reported
+    season_type='pre', week=3, while the real regular season hadn't started).
+    Before the season starts, this returns week 1 (nothing meaningful to
+    compute yet, but a safe/valid week number for callers). Once the season
+    is over (season_type='post'), this clamps to week 18 rather than
+    reporting a playoff week number - the projection pipeline has no concept
+    of playoff weeks.
+    """
     r = requests.get("https://api.sleeper.app/v1/state/nfl", timeout=15)
     r.raise_for_status()
     d = r.json()
-    return int(d["league_season"]), int(d["display_week"])
+    season = int(d["league_season"])
+    season_type = d.get("season_type")
+    if season_type == "pre":
+        return season, 1
+    if season_type == "post":
+        return season, 18
+    return season, int(d["display_week"])
 
 
 def fetch_nflreadpy(season, week=None):
@@ -229,7 +248,7 @@ def fetch_espn(season, week, supabase):
         return []
 
 
-def get_weekly_player_stats(season, week, supabase, prefer=("sleeper", "nflreadpy", "espn")):
+def get_weekly_player_stats(season, week, supabase, prefer=("nflreadpy", "sleeper", "espn")):
     """
     Tries each source in order until one returns rows. Returns (source_name, rows).
     """

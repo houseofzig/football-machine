@@ -11,26 +11,30 @@ holding a share bigger than a full team's worth once summed with the real
 starters.
 
 pass_attempt_share (QB) isn't normalized here - compute_player_share_baseline
-already hardcodes it to 1.0 for any QB being projected, and only one QB is
-ever in the pool per team (see run_mock_projection.get_player_pool), so
-there's nothing to normalize across.
+gives the starter (slot_key ending "_0") 1.0 and every other QB on the team
+0.0 (see its is_starter param), so the sum is already exactly 1.0 with
+nothing to rescale. get_player_pool no longer filters non-starter QBs out of
+the pool entirely (2026-08-28) - they get a real, editable row with 0 default
+production instead of not existing at all.
 """
 from .matchup import compute_player_share_baseline
 
 
 def normalize_team_shares(supabase, team, players, season, week):
     """
-    players: list of {"player_id", "player_name", "position"} for every
-    player on this team being projected. Returns {player_name: share_dict}
-    with carry_share and target_share rescaled to sum to 1.0 across the team
-    (only among players who actually carry/target - QB carry_share and
-    RB/WR/TE target_share both count toward pools, matching how real offenses
-    share touches across positions).
+    players: list of {"player_id", "player_name", "position", "slot_key"} for
+    every player on this team being projected. Returns {player_name:
+    share_dict} with carry_share and target_share rescaled to sum to 1.0
+    across the team (only among players who actually carry/target - QB
+    carry_share and RB/WR/TE target_share both count toward pools, matching
+    how real offenses share touches across positions).
     """
     raw = {}
     for p in players:
+        is_starter = (p.get("slot_key") or "").endswith("_0")
         raw[p["player_name"]] = compute_player_share_baseline(
             supabase, p["player_id"], p["position"], team, season, week, p["player_name"],
+            is_starter=is_starter,
         )
 
     carry_sum = sum((s.get("carry_share") or 0) for s in raw.values())

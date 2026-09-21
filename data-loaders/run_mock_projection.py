@@ -30,27 +30,48 @@ def build_opponent_map(supabase, season, week):
             lambda q: q.eq("game_type", "REG"),
         ],
     )
+    # schedules is loaded verbatim from nflverse, which uses "LA" for the
+    # Rams (to disambiguate from the Chargers' "LAC"); every other table in
+    # this project - projections_2026_resolved, the site's own ROSTERS,
+    # etc. - uses "LAR". Confirmed real bug, 9/4: with no normalization
+    # here, this map ends up keyed by "LA", so write_weekly_tables.py's
+    # lookup by "LAR" (the convention its own by_team dict actually uses,
+    # from projections_2026_resolved) silently misses and the entire Rams
+    # roster gets skipped - no exception, just a quiet `continue`. Confirmed
+    # via a direct diff of both tables' team codes that LA/LAR is the ONLY
+    # mismatch across all 32 teams - nothing else needs this treatment.
+    def _norm(code):
+        return "LAR" if code == "LA" else code
     m = {}
     for r in rows:
-        m[r["home_team"]] = r["away_team"]
-        m[r["away_team"]] = r["home_team"]
+        home, away = _norm(r["home_team"]), _norm(r["away_team"])
+        m[home] = away
+        m[away] = home
     return m
 
 
 def get_player_pool(supabase):
     """
-    Only one QB plays per team per week - unlike RB/WR/TE, which genuinely
-    split touches across multiple rostered players, so those stay unfiltered.
-    slot_key (e.g. 'NYG_qb_0') encodes depth chart rank, 0 = starter; without
-    this filter every backup QB with any real 2024/2025 attempts got treated
-    as a starter too (confirmed bug: Jameis Winston, Anthony Richardson,
-    Daniel Jones, Riley Leonard all projected as QB1 on their own teams).
+    Includes every QB on a team's depth chart, not just the starter - unlike
+    RB/WR/TE, which genuinely split touches across multiple rostered players.
+    slot_key (e.g. 'NYG_qb_0') encodes depth chart rank, 0 = starter.
+
+    Backup QBs used to be filtered out entirely here (confirmed real bug
+    without a filter of some kind: Jameis Winston, Anthony Richardson, Daniel
+    Jones, Riley Leonard all got projected as QB1 on their own teams, each
+    independently getting the team's full pass-attempt share). As of
+    2026-08-28 backups are included again, but the double-counting is fixed
+    at the actual source instead: compute_player_share_baseline's is_starter
+    param (driven by this same slot_key, see common/team_shares.py) gives
+    only the "_0" starter a 1.0 pass_attempt_share - every other QB on the
+    team gets 0.0 by default. That gives backups a real, admin-editable row
+    (sleeper_id included) instead of not existing in the pipeline at all,
+    without reintroducing the original bug.
     """
     rows = select_all(
-        supabase, "projections_2026_resolved", "player_id,player_name,team,position,slot_key",
+        supabase, "projections_2026_resolved", "player_id,player_name,team,position,slot_key,sleeper_id",
         filters=[lambda q: q.eq("projection_year", 2026), lambda q: q.in_("position", list(POSITIONS))],
     )
-    rows = [r for r in rows if r["position"] != "QB" or (r.get("slot_key") or "").endswith("_0")]
     seen = set()
     pool = []
     for r in rows:

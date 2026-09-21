@@ -13,11 +13,10 @@ Design (agreed with the user):
     of player_stats_weekly rows for that team/week - not snap-derived.
   - Baseline blend is a three-tier weighted mix, always: career (the
     preseason model's own output) < last 2 real seasons < current season.
-    Current season dominates fast, not gradually - weight starts at
-    CURRENT_SEASON_FLOOR (0.6) on the very first real game this season and
-    ramps to 1.0 (fully dominant, prior tiers drop out entirely) by
-    CURRENT_SEASON_RAMP_GAMES (4) games played - see _current_season_weight.
-    Whatever weight isn't current-season is split LAST2_VS_CAREER_WEIGHT
+    Current season dominates fast, not gradually - weight is looked up by
+    games played this season from CURRENT_SEASON_WEIGHT_BY_GAME (30% at 1
+    game, up to 1.0/fully dominant by 5 games, prior tiers drop out entirely)
+    - see _current_season_weight. Whatever weight isn't current-season is split LAST2_VS_CAREER_WEIGHT
     toward last-2-seasons and the rest toward career/preseason - last 2
     seasons always outweighs career, never the other way around. If a
     player has zero real games anywhere (true rookie with no preseason row
@@ -37,24 +36,32 @@ from .db import select_all
 
 RECENT_WINDOW = 4
 QUALIFYING_GAME_THRESHOLD = 4
-CURRENT_SEASON_FLOOR = 0.6  # weight current season gets as soon as ANY game exists this season
-CURRENT_SEASON_RAMP_GAMES = 4  # games this season before current-season weight reaches 1.0 (fully dominant)
+# Current-season weight by games played this season (updated 2026-09-16, user
+# request - replaces the old floor+linear-ramp formula since these numbers
+# don't fit a straight line: +10 from game 1->2, then +20 each game after).
+# 0 games isn't listed - _current_season_weight returns 0 for that case
+# (nothing this season to weight yet). 5+ games -> 1.0, same as before: once
+# current season is fully dominant it just stays there for the rest of the
+# season, prior tiers drop out entirely.
+CURRENT_SEASON_WEIGHT_BY_GAME = {1: 0.30, 2: 0.40, 3: 0.60, 4: 0.80}
 LAST2_VS_CAREER_WEIGHT = 0.7  # of the non-current-season weight, how much goes to last-2-seasons vs career/preseason (at full confidence)
 LAST2_TRUST_GAMES = 8  # real games in the last 2 seasons before that tier is trusted at its full LAST2_VS_CAREER_WEIGHT
 
 
 def _current_season_weight(games_this_season):
     """
-    Fast ramp ("Option A"): this season's own data should dominate by a large
-    margin almost immediately, not gradually earn trust over half a season.
-    Zero games this season -> 0 (nothing to weight yet). One real game ->
-    already 70% weight (CURRENT_SEASON_FLOOR + one ramp step). By
-    CURRENT_SEASON_RAMP_GAMES games -> 100%, prior (last-2-seasons + career,
-    or last season for opponent/team effects) drops out entirely.
+    Fast ramp: this season's own data should dominate by a large margin
+    almost immediately, not gradually earn trust over half a season. Zero
+    games this season -> 0 (nothing to weight yet). See
+    CURRENT_SEASON_WEIGHT_BY_GAME for games 1-4; by 5 games -> 100%, prior
+    (last-2-seasons + career, or last season for opponent/team effects)
+    drops out entirely.
     """
     if games_this_season <= 0:
         return 0.0
-    return CURRENT_SEASON_FLOOR + (1 - CURRENT_SEASON_FLOOR) * min(1.0, games_this_season / CURRENT_SEASON_RAMP_GAMES)
+    if games_this_season >= 5:
+        return 1.0
+    return CURRENT_SEASON_WEIGHT_BY_GAME[games_this_season]
 
 
 def _last2_weight(games_count):
@@ -133,6 +140,24 @@ def weighted_rate(games, numerator_field, denominator_field):
     return num / den
 
 
+def _week1_prior(preseason_val, blended_prior, week):
+    """
+    Week 1 special case: by definition there's no real current-season data
+    yet, so instead of blending real last-2-seasons performance into the
+    "prior" tier (career_rate/career_cs above is actually already the
+    preseason projection value - see compute_player_baseline/
+    compute_player_share_baseline), just use the preseason projection
+    as-is. Falls back to the normal blended prior if this player/stat has
+    no preseason value at all (no site preseason row - rare fringe case).
+    Every other week is untouched (current_rate/current_cs always resolve
+    to None at week 1 anyway, since qualifying_this_season is empty, so
+    this only ever changes what week-1 rows compute).
+    """
+    if week == 1 and preseason_val is not None:
+        return preseason_val
+    return blended_prior
+
+
 def _blend(a, b, weight_b):
     if a is None and b is None:
         return None
@@ -198,6 +223,27 @@ def get_preseason_share_baseline(supabase, player_id, player_name):
     return {stat_name: row.get(col) for col, stat_name in PRESEASON_SHARE_MAP.items()}
 
 
+# ── One-time week-2 special blend (user request, 2026-09-16) ────────────────
+# ros_projections_2026 uses the exact same proj_* column names as
+# projections_2026_resolved (both written by the same pipeline shape), so the
+# existing PRESEASON_RATE_MAP/PRESEASON_SHARE_MAP translate a ROS row exactly
+# as they do a preseason row - no new mapping needed. These two take an
+# ALREADY-FETCHED row (the caller fetches ros_projections_2026 once for every
+# player, not per-player) rather than looking one up themselves, unlike
+# get_preseason_baseline/get_preseason_share_baseline above.
+def get_ros_baseline_from_row(row, position):
+    if not row:
+        return None
+    return {stat_name: row.get(col) for col, stat_name in PRESEASON_RATE_MAP.items()
+            if stat_name in POSITION_RATE_STATS.get(position, {})}
+
+
+def get_ros_share_baseline_from_row(row):
+    if not row:
+        return None
+    return {stat_name: row.get(col) for col, stat_name in PRESEASON_SHARE_MAP.items()}
+
+
 @lru_cache(maxsize=None)
 def compute_player_baseline(supabase, player_id, position, season, week, player_name=None):
     """
@@ -243,7 +289,7 @@ def compute_player_baseline(supabase, player_id, position, season, week, player_
         recent_rate = weighted_rate(recent, num_f, den_f)
         current_rate = _blend(season_to_date_rate, recent_rate, within_season_weight_recent)
 
-        prior_combined = _blend(career_rate, last2_rate, last2_weight)
+        prior_combined = _week1_prior(career_rate, _blend(career_rate, last2_rate, last2_weight), week)
         result[stat_name] = _blend(prior_combined, current_rate, weight_current)
     return result
 
@@ -274,7 +320,8 @@ def compute_team_attempts_baseline(supabase, team, season, week):
     team-attempts source exists, so this is a 2-tier version of the same
     philosophy as compute_player_baseline: last 2 real seasons < current
     season, with current season dominating quickly (weight ramps to 1.0 by
-    CURRENT_SEASON_RAMP_GAMES games played this season - see _current_season_weight).
+    5 games played this season - see _current_season_weight /
+    CURRENT_SEASON_WEIGHT_BY_GAME).
     """
     team_totals = team_totals_by_week(supabase, team, season - 2)
     all_games = sorted(
@@ -306,7 +353,7 @@ def compute_team_attempts_baseline(supabase, team, season, week):
 
 
 @lru_cache(maxsize=None)
-def compute_player_share_baseline(supabase, player_id, position, team, season, week, player_name=None):
+def compute_player_share_baseline(supabase, player_id, position, team, season, week, player_name=None, is_starter=True):
     """
     Blended (tiered) carry share and target share for a player, using the same
     volume-weighted approach as compute_player_baseline: sum(player's stat
@@ -316,6 +363,13 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
     compute_player_baseline. The preseason table has no QB pass-attempt-share
     equivalent, so a rookie projected as a starter defaults to 1.0 there
     (assume they take ~all the team's dropbacks) rather than 0.
+
+    is_starter: whether this player holds the depth-chart starter slot at
+    their position (slot_key ending "_0" - see run_mock_projection.
+    get_player_pool). Only matters for QB - see finalize() below. Defaults
+    to True so any caller not yet passing it keeps the old single-QB-in-pool
+    behavior; callers that project a full depth chart (get_player_pool no
+    longer filters to starters only) must pass this explicitly.
     """
     all_games = fetch_player_games(supabase, player_id, season, week)
     this_season_games = [g for g in all_games if g["season"] == season]
@@ -337,12 +391,19 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
         return carry_share, target_share, pass_attempt_share
 
     def finalize(result):
-        # Any QB actually being projected is, by definition, the one taking
-        # the team's dropbacks that week - real historical share computed
-        # from a thin sample (a QB1 who missed games, a spot-starter game)
-        # is not a better estimate than just "they get the team's attempts."
+        # The depth-chart starter is, by definition, the one taking the
+        # team's dropbacks that week - real historical share computed from a
+        # thin sample (a QB1 who missed games, a spot-starter game) is not a
+        # better estimate than just "they get the team's attempts." A
+        # backup QB gets 0 by default instead - not on the field, but still
+        # a real row that exists and can be edited/admin-overridden (e.g. to
+        # model an injury takeover), rather than being excluded from the
+        # pipeline entirely. Getting this right is why get_player_pool no
+        # longer filters backups out silently - see its docstring for the
+        # original bug (every QB with any history treated as a 1.0-share
+        # starter) this is fixing without reintroducing.
         if position == "QB":
-            result["pass_attempt_share"] = 1.0
+            result["pass_attempt_share"] = 1.0 if is_starter else 0.0
         return result
 
     prior_seasons_games = [
@@ -386,9 +447,9 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
     current_ts = _blend(season_ts, recent_ts, within_season_weight_recent)
     current_as = _blend(season_as, recent_as, within_season_weight_recent)
 
-    prior_cs = _blend(career_cs, last2_cs, last2_weight)
-    prior_ts = _blend(career_ts, last2_ts, last2_weight)
-    prior_as = _blend(career_as, last2_as, last2_weight)
+    prior_cs = _week1_prior(career_cs, _blend(career_cs, last2_cs, last2_weight), week)
+    prior_ts = _week1_prior(career_ts, _blend(career_ts, last2_ts, last2_weight), week)
+    prior_as = _week1_prior(career_as, _blend(career_as, last2_as, last2_weight), week)
 
     return finalize({
         "source": "blend",
