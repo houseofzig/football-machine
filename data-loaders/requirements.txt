@@ -1,6 +1,7 @@
 nflreadpy
 pandas
 polars
+pyarrow
 supabase
 requests
 python-dotenv
