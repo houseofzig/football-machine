@@ -13,7 +13,7 @@ import argparse
 
 import nflreadpy as nfl
 
-from common.db import CURRENT_SEASON, df_to_clean_rows, get_client, upsert_batched
+from common.db import CURRENT_SEASON, df_to_clean_rows, fix_team_abbrs, get_client, upsert_batched
 from common.sources import get_current_week
 
 
@@ -21,6 +21,7 @@ def load_seasons(supabase, seasons, label=None):
     print(f"Pulling schedules for seasons: {seasons}...")
     schedules = nfl.load_schedules(seasons=seasons).to_pandas()
     schedules["gameday"] = schedules["gameday"].astype(str)
+    schedules = fix_team_abbrs(schedules, "home_team", "away_team")
     rows = df_to_clean_rows(schedules)
     upsert_batched(supabase, "schedules", rows, on_conflict="game_id", label=label)
 

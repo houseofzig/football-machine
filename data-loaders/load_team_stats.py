@@ -10,7 +10,7 @@ import argparse
 
 import nflreadpy as nfl
 
-from common.db import CURRENT_SEASON, df_to_clean_rows, get_client, upsert_batched
+from common.db import CURRENT_SEASON, df_to_clean_rows, fix_team_abbrs, get_client, upsert_batched
 
 ON_CONFLICT = "team,season"
 
@@ -18,6 +18,7 @@ ON_CONFLICT = "team,season"
 def load_seasons(supabase, seasons, label=None):
     print(f"Pulling team stats for seasons: {seasons}...")
     team_stats = nfl.load_team_stats(seasons=seasons, summary_level="reg").to_pandas()
+    team_stats = fix_team_abbrs(team_stats, "team")
     team_stats = team_stats.drop_duplicates(subset=["team", "season"])
     rows = df_to_clean_rows(team_stats)
     upsert_batched(supabase, "team_stats", rows, on_conflict=ON_CONFLICT, label=label)

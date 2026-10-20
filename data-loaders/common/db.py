@@ -64,6 +64,36 @@ def df_to_clean_rows(df):
     return clean_rows(df.to_dict(orient="records"))
 
 
+# nflverse's own team-code convention differs from the rest of this project
+# for one team: nflreadpy calls the Rams "LA" (an old nflverse quirk,
+# distinguishing them from "LAC" the Chargers), while everywhere else in this
+# pipeline - projections_2026_resolved, ff_playerids, the site itself - uses
+# the real, standard "LAR". Confirmed real bug, 2026-09-29: this silently
+# orphaned every Rams player from schedules/player_stats_weekly/team_stats/
+# snap_counts (all sourced from nflreadpy), so their team-level volume
+# baseline (compute_team_attempts_baseline) always came back "no_history" -
+# Stafford, Kyren Williams, Puka Nacua, and Davante Adams all confirmed live,
+# week 4 dry run, silently skipped from the entire weekly projections run
+# despite being obvious, clear starters. Root-caused and fixed at the source
+# (every nflreadpy loader), rather than patched around inside matchup.py,
+# so nothing downstream ever needs to know this mismatch existed.
+NFLVERSE_TEAM_ABBR_FIXES = {"LA": "LAR"}
+
+
+def fix_team_abbrs(df, *columns):
+    """
+    Applies NFLVERSE_TEAM_ABBR_FIXES to each named column that exists on df
+    (missing columns are silently skipped, so the same call works across
+    schedules' home_team/away_team and team_stats/snap_counts/player_stats'
+    plain team column). Call this on every DataFrame pulled directly from
+    nflreadpy, before it's written anywhere.
+    """
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].replace(NFLVERSE_TEAM_ABBR_FIXES)
+    return df
+
+
 _table_columns_cache = {}
 
 

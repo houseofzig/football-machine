@@ -30,11 +30,20 @@ Design (agreed with the user):
       2) Team-volume delta - how a defense affects the whole offense's shape
          (run funnel / pass funnel, and total play volume) vs league average.
 """
+import statistics
+from collections import defaultdict
 from functools import lru_cache
 
 from .db import select_all
 
 RECENT_WINDOW = 4
+# Partial games (user, 2026-10-20: "players who did not play full games have
+# that production screw with their projections" - Ja'Marr Chase week 4 at 20%
+# of snaps, Justin Jefferson week 3 at 12%). A game where the player was on the
+# field for less than this fraction of his usual (median) offensive snap share
+# that season is left out of both his shares and his efficiencies - see
+# partial_games. User chose "half his usual snap share".
+PARTIAL_GAME_SNAP_RATIO = 0.5
 QUALIFYING_GAME_THRESHOLD = 4
 # Current-season weight by games played this season (updated 2026-09-16, user
 # request - replaces the old floor+linear-ramp formula since these numbers
@@ -181,6 +190,54 @@ def fetch_player_games(supabase, player_id, before_season, before_week):
     return rows
 
 
+@lru_cache(maxsize=None)
+def _snap_pct_by_player(supabase):
+    """{pfr_player_id: {season: {week: offense_pct}}} for REG games, 2024 on -
+    loaded once per run (snap_counts has no gsis id; see _pfr_by_gsis)."""
+    rows = select_all(
+        supabase, "snap_counts", "pfr_player_id,season,week,offense_pct,game_type",
+        filters=[lambda q: q.gte("season", 2024), lambda q: q.eq("game_type", "REG")],
+    )
+    out = defaultdict(lambda: defaultdict(dict))
+    for r in rows:
+        if r.get("pfr_player_id") and r.get("offense_pct") is not None:
+            out[r["pfr_player_id"]][r["season"]][r["week"]] = r["offense_pct"]
+    return out
+
+
+@lru_cache(maxsize=None)
+def _pfr_by_gsis(supabase):
+    """gsis player_id -> Pro Football Reference id, from the ff_playerids crosswalk."""
+    rows = select_all(supabase, "ff_playerids", "gsis_id,pfr_id",
+                      filters=[lambda q: q.not_.is_("pfr_id", "null")], order_by="gsis_id")
+    return {r["gsis_id"]: r["pfr_id"] for r in rows if r.get("gsis_id") and r.get("pfr_id")}
+
+
+@lru_cache(maxsize=None)
+def partial_games(supabase, player_id):
+    """(season, week) games where the player's offensive snap share was under
+    PARTIAL_GAME_SNAP_RATIO x his median share that season. Matched by ID
+    (gsis -> pfr id -> snap_counts). A player with no pfr id, or a season with
+    fewer than 2 snap rows, filters nothing."""
+    pfr = _pfr_by_gsis(supabase).get(player_id)
+    seasons = _snap_pct_by_player(supabase).get(pfr) if pfr else None
+    out = set()
+    for season, weeks in (seasons or {}).items():
+        if len(weeks) < 2:
+            continue
+        cutoff = PARTIAL_GAME_SNAP_RATIO * statistics.median(weeks.values())
+        out |= {(season, wk) for wk, pct in weeks.items() if pct < cutoff}
+    return frozenset(out)
+
+
+def fetch_full_games(supabase, player_id, before_season, before_week):
+    """fetch_player_games minus partial games (see partial_games) - what both
+    the efficiency and the share baselines are built from."""
+    skip = partial_games(supabase, player_id)
+    return [g for g in fetch_player_games(supabase, player_id, before_season, before_week)
+            if (g["season"], g["week"]) not in skip]
+
+
 def _match_preseason_row(supabase, player_id, player_name):
     """
     projections_2026_resolved is the live preseason model's own output - read
@@ -244,17 +301,96 @@ def get_ros_share_baseline_from_row(row):
     return {stat_name: row.get(col) for col, stat_name in PRESEASON_SHARE_MAP.items()}
 
 
-@lru_cache(maxsize=None)
-def compute_player_baseline(supabase, player_id, position, season, week, player_name=None):
+# ── Permanent replacement of the career/preseason tier with ROS, every week
+# (user request, 2026-09-26) ─────────────────────────────────────────────
+# Below the Week-2-special-blend functions above (which read an
+# ALREADY-FETCHED ros_projections_2026 row the caller passes in), these do
+# their own per-player lookup - same pattern as _match_preseason_row/
+# get_preseason_baseline/get_preseason_share_baseline just above, since
+# compute_player_baseline/compute_player_share_baseline call these directly,
+# one player at a time, same as they always called the preseason versions.
+#
+# IMPORTANT - this can NEVER call compute_player_baseline (directly or
+# indirectly): write_ros_tables.py computes ros_projections_2026 BY calling
+# compute_player_baseline itself (career/preseason < last-2-seasons <
+# current-season, unchanged - see that file). If this read ros_projections_2026
+# by calling compute_player_baseline again, it would recurse forever. Instead
+# this only ever reads whatever ROS row is CURRENTLY SAVED in the table - "when
+# I mention ROS it should be what is last saved as ROS" (user, 2026-09-26) -
+# a plain, one-time-per-call read, exactly like the preseason lookup it
+# replaces. write_ros_tables.py's own career tier is untouched by this change
+# (still the real preseason model, projections_2026_resolved) - ROS needs a
+# foundation that doesn't depend on ROS.
+def _match_ros_row(supabase, player_id, player_name, season):
     """
+    ros_projections_2026 is this project's own rest-of-season projection
+    (write_ros_tables.py, re-run each week) - read only, never recomputed
+    here. Matched the same way _match_preseason_row matches
+    projections_2026_resolved (id first, name fallback) - ros_projections_2026
+    uses the same player_id (gsis-style) column, not sleeper_id, so no
+    crosswalk is needed here.
+    """
+    rows = select_all(
+        supabase, "ros_projections_2026", "*",
+        filters=[lambda q: q.eq("season", season)],
+    )
+    if player_id:
+        for r in rows:
+            if r.get("player_id") == player_id:
+                return r
+    if player_name:
+        target = player_name.strip().lower()
+        for r in rows:
+            if (r.get("player_name") or "").strip().lower() == target:
+                return r
+    return None
+
+
+def get_ros_baseline(supabase, player_id, player_name, position, season):
+    """ROS rate-stat baseline for a player - the career/preseason tier's
+    replacement in compute_player_baseline (2026-09-26). See the module
+    note above this function for why it reads the table directly instead of
+    calling compute_player_baseline."""
+    row = _match_ros_row(supabase, player_id, player_name, season)
+    return get_ros_baseline_from_row(row, position)
+
+
+def get_ros_share_baseline(supabase, player_id, player_name, season):
+    """ROS share baseline for a player - the career/preseason tier's
+    replacement in compute_player_share_baseline (2026-09-26)."""
+    row = _match_ros_row(supabase, player_id, player_name, season)
+    return get_ros_share_baseline_from_row(row)
+
+
+@lru_cache(maxsize=None)
+def compute_player_baseline(supabase, player_id, position, season, week, player_name=None, saved_ros_weight=None):
+    """
+    saved_ros_weight (ROS write only, 2026-10-13 - default None leaves the
+    weekly pipeline exactly as it was): when set, the model is computed
+    WITHOUT the last-saved ROS row as its "career" tier (last-2-seasons /
+    current-season blend only), then the saved ROS row is folded in at this
+    fixed weight: final = (1 - w) * model + w * saved_ROS. A player with no
+    qualifying game this season and a saved ROS row comes back as
+    source="ros_kept" (their saved ROS, untouched - user's call: "keep their
+    saved ROS"), so the ROS writer leaves that row alone.
+
     Returns {"source": ..., "games_used": N, <stat_name>: rate, ...} for this
     player heading into `season`/`week`. Three-tier weighted blend (career <
     last 2 seasons < current season - see module docstring). `source` is
-    "no_history" (nothing anywhere to compute from), "preseason_fallback"
-    (zero real games, pure preseason model output), or "blend" (some mix of
-    the three tiers, per-stat weights vary with how much real data exists).
+    "no_history" (nothing anywhere to compute from), "ros_fallback" (zero
+    real games, pure ROS-projection output), or "blend" (some mix of the
+    three tiers, per-stat weights vary with how much real data exists).
+
+    The "career" tier is the last-saved ROS projection (ros_projections_2026),
+    not the preseason model directly - permanent change, user, 2026-09-26
+    ("when I mention ROS it should be what is last saved as ROS"). See
+    get_ros_baseline's own docstring for why this reads the table directly
+    instead of calling compute_player_baseline (avoiding a circular
+    dependency, since write_ros_tables.py computes that very table BY calling
+    compute_player_baseline). Last-2-seasons/current-season tiers and the
+    games-played ramp between them are unchanged.
     """
-    all_games = fetch_player_games(supabase, player_id, season, week)
+    all_games = fetch_full_games(supabase, player_id, season, week)  # partial games left out (see partial_games)
     this_season_games = [g for g in all_games if g["season"] == season]
     qualifying_this_season = [g for g in this_season_games if is_qualifying_game(g, position)]
     prior_seasons_games = [
@@ -266,15 +402,20 @@ def compute_player_baseline(supabase, player_id, position, season, week, player_
     result = {"games_used": len(qualifying_this_season)}
 
     if not qualifying_this_season and not prior_seasons_games:
-        preseason = get_preseason_baseline(supabase, player_id, player_name, position)
-        if not preseason:
+        ros_career = get_ros_baseline(supabase, player_id, player_name, position, season)
+        if not ros_career:
             result["source"] = "no_history"
             return result
-        result["source"] = "preseason_fallback"
-        result.update(preseason)
+        result["source"] = "ros_fallback"
+        result.update(ros_career)
         return result
 
-    preseason = get_preseason_baseline(supabase, player_id, player_name, position)
+    preseason = get_ros_baseline(supabase, player_id, player_name, position, season)
+    if saved_ros_weight is not None and not qualifying_this_season and preseason:
+        # ROS write, no real 2026 game yet: keep the saved ROS as-is (see docstring).
+        result["source"] = "ros_kept"
+        result.update(preseason)
+        return result
     weight_current = _current_season_weight(len(qualifying_this_season))
     last2_weight = _last2_weight(len(prior_seasons_games))
     recent = qualifying_this_season[-RECENT_WINDOW:]
@@ -283,14 +424,20 @@ def compute_player_baseline(supabase, player_id, position, season, week, player_
 
     result["source"] = "blend"
     for stat_name, (num_f, den_f) in stats.items():
-        career_rate = (preseason or {}).get(stat_name)
+        saved_ros_rate = (preseason or {}).get(stat_name)
+        # ROS write: the saved ROS is NOT a tier inside the model, it is folded
+        # in once at the end at saved_ros_weight (below).
+        career_rate = None if saved_ros_weight is not None else saved_ros_rate
         last2_rate = weighted_rate(prior_seasons_games, num_f, den_f)
         season_to_date_rate = weighted_rate(qualifying_this_season, num_f, den_f)
         recent_rate = weighted_rate(recent, num_f, den_f)
         current_rate = _blend(season_to_date_rate, recent_rate, within_season_weight_recent)
 
         prior_combined = _week1_prior(career_rate, _blend(career_rate, last2_rate, last2_weight), week)
-        result[stat_name] = _blend(prior_combined, current_rate, weight_current)
+        model_rate = _blend(prior_combined, current_rate, weight_current)
+        if saved_ros_weight is not None:
+            model_rate = _blend(model_rate, saved_ros_rate, saved_ros_weight)
+        result[stat_name] = model_rate
     return result
 
 
@@ -353,8 +500,14 @@ def compute_team_attempts_baseline(supabase, team, season, week):
 
 
 @lru_cache(maxsize=None)
-def compute_player_share_baseline(supabase, player_id, position, team, season, week, player_name=None, is_starter=True):
+def compute_player_share_baseline(supabase, player_id, position, team, season, week, player_name=None, is_starter=True, saved_ros_weight=None):
     """
+    saved_ros_weight: ROS write only (2026-10-13), same meaning as in
+    compute_player_baseline - the saved ROS shares are folded in once at this
+    fixed weight instead of being a tier inside the model, and a player with
+    no qualifying game this season keeps their saved ROS shares as-is.
+    Default None = weekly pipeline unchanged.
+
     Blended (tiered) carry share and target share for a player, using the same
     volume-weighted approach as compute_player_baseline: sum(player's stat
     over games) / sum(team's stat over the same games), not average-of-ratios.
@@ -371,7 +524,7 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
     behavior; callers that project a full depth chart (get_player_pool no
     longer filters to starters only) must pass this explicitly.
     """
-    all_games = fetch_player_games(supabase, player_id, season, week)
+    all_games = fetch_full_games(supabase, player_id, season, week)  # partial games left out (see partial_games)
     this_season_games = [g for g in all_games if g["season"] == season]
     qualifying_this_season = [g for g in this_season_games if is_qualifying_game(g, position)]
 
@@ -402,8 +555,19 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
         # longer filters backups out silently - see its docstring for the
         # original bug (every QB with any history treated as a 1.0-share
         # starter) this is fixing without reintroducing.
+        #
+        # carry_share gets the same treatment (added 2026-09-29 - confirmed
+        # real bug: this only ever zeroed pass_attempt_share, so a veteran
+        # backup with any career rushing history - Case Keenum, Tua
+        # Tagovailoa, Tyrod Taylor, Andy Dalton all confirmed live, week 3 -
+        # kept a nonzero blended carry_share despite correctly showing
+        # pass_attempt_share=0. A backup QB not on the field can't rack up
+        # scramble/kneel-down carries any more than they can complete passes -
+        # same reasoning, just never extended to this field before.
         if position == "QB":
             result["pass_attempt_share"] = 1.0 if is_starter else 0.0
+            if not is_starter:
+                result["carry_share"] = 0.0
         return result
 
     prior_seasons_games = [
@@ -412,34 +576,45 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
     ]
 
     if not qualifying_this_season and not prior_seasons_games:
-        preseason = get_preseason_share_baseline(supabase, player_id, player_name)
+        preseason = get_ros_share_baseline(supabase, player_id, player_name, season)
         if not preseason:
             return finalize({"source": "no_history", "carry_share": None, "target_share": None, "pass_attempt_share": None})
         return finalize({
-            "source": "preseason_fallback",
+            "source": "ros_fallback",
             "carry_share": preseason.get("carry_share"),
             "target_share": preseason.get("target_share"),
             "pass_attempt_share": preseason.get("pass_attempt_share"),
         })
 
     # Three-tier weighted blend, same philosophy as compute_player_baseline:
-    # career (preseason model) < last 2 real seasons < current season, with
-    # current season dominating quickly as real games accumulate. Previously
-    # this collapsed "last 2 seasons" and "current season" into one bucket
-    # once ANY real games existed - a single qualifying game (as low as 2
-    # touches/targets) produced shares as extreme as 27-35% for deep-bench
-    # players with one emergency-duty game (confirmed on real data: Ben
-    # Sims, Nikko Remigio). Keeping the tiers separate and properly weighted
-    # fixes that at the root instead of just shrinking the symptom.
-    preseason = get_preseason_share_baseline(supabase, player_id, player_name)
+    # career (last-saved ROS projection, 2026-09-26 - see compute_player_baseline's
+    # docstring) < last 2 real seasons < current season, with current season
+    # dominating quickly as real games accumulate. Previously this collapsed
+    # "last 2 seasons" and "current season" into one bucket once ANY real
+    # games existed - a single qualifying game (as low as 2 touches/targets)
+    # produced shares as extreme as 27-35% for deep-bench players with one
+    # emergency-duty game (confirmed on real data: Ben Sims, Nikko Remigio).
+    # Keeping the tiers separate and properly weighted fixes that at the root
+    # instead of just shrinking the symptom.
+    preseason = get_ros_share_baseline(supabase, player_id, player_name, season)
+    if saved_ros_weight is not None and not qualifying_this_season and preseason:
+        # ROS write, no real 2026 game yet: keep the saved ROS shares as-is.
+        return finalize({
+            "source": "ros_kept",
+            "carry_share": preseason.get("carry_share"),
+            "target_share": preseason.get("target_share"),
+            "pass_attempt_share": preseason.get("pass_attempt_share"),
+        })
     weight_current = _current_season_weight(len(qualifying_this_season))
     last2_weight = _last2_weight(len(prior_seasons_games))
     recent = qualifying_this_season[-RECENT_WINDOW:]
     within_season_weight_recent = min(1.0, len(qualifying_this_season) / (QUALIFYING_GAME_THRESHOLD * 2)) if qualifying_this_season else 0.0
 
-    career_cs, career_ts, career_as = (
+    saved_cs, saved_ts, saved_as = (
         (preseason or {}).get("carry_share"), (preseason or {}).get("target_share"), (preseason or {}).get("pass_attempt_share"),
     )
+    # ROS write: the saved ROS is folded in once at the end, not a tier here.
+    career_cs, career_ts, career_as = (None, None, None) if saved_ros_weight is not None else (saved_cs, saved_ts, saved_as)
     last2_cs, last2_ts, last2_as = shares_for(prior_seasons_games)
     season_cs, season_ts, season_as = shares_for(qualifying_this_season)
     recent_cs, recent_ts, recent_as = shares_for(recent)
@@ -451,11 +626,19 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
     prior_ts = _week1_prior(career_ts, _blend(career_ts, last2_ts, last2_weight), week)
     prior_as = _week1_prior(career_as, _blend(career_as, last2_as, last2_weight), week)
 
+    model_cs = _blend(prior_cs, current_cs, weight_current)
+    model_ts = _blend(prior_ts, current_ts, weight_current)
+    model_as = _blend(prior_as, current_as, weight_current)
+    if saved_ros_weight is not None:
+        model_cs = _blend(model_cs, saved_cs, saved_ros_weight)
+        model_ts = _blend(model_ts, saved_ts, saved_ros_weight)
+        model_as = _blend(model_as, saved_as, saved_ros_weight)
+
     return finalize({
         "source": "blend",
-        "carry_share": _blend(prior_cs, current_cs, weight_current),
-        "target_share": _blend(prior_ts, current_ts, weight_current),
-        "pass_attempt_share": _blend(prior_as, current_as, weight_current),
+        "carry_share": model_cs,
+        "target_share": model_ts,
+        "pass_attempt_share": model_as,
     })
 
 
@@ -542,7 +725,15 @@ def _league_average_games(supabase, position, before_season, before_week, season
 # Clip band is the hard safety rail; shrinkage below softens it further based
 # on how many games actually informed the number.
 VOLATILE_STATS = {"rush_td_rate", "rec_td_rate", "pass_td_rate", "pass_int_rate"}
-CLIP_BANDS = {"volatile": (0.9, 1.1), "stable": (0.9, 1.1)}
+# 2026-10-13 (user: "cap the matchup deltas to 7%"): was (0.9, 1.1), i.e. +/-10%.
+# One number for every opponent adjustment - position efficiency (yds/carry,
+# catch rate, yds/catch, yds/attempt, comp%, TD/INT rates) and team volume
+# (total plays, rush share). Weekly pipeline only; ROS applies no deltas.
+MATCHUP_DELTA_CAP = 0.07
+CLIP_BANDS = {
+    "volatile": (1.0 - MATCHUP_DELTA_CAP, 1.0 + MATCHUP_DELTA_CAP),
+    "stable": (1.0 - MATCHUP_DELTA_CAP, 1.0 + MATCHUP_DELTA_CAP),
+}
 SHRINKAGE_GAMES = 12  # games faced before a delta is trusted at its full raw value
 
 

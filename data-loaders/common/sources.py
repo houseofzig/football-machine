@@ -31,7 +31,7 @@ carry share, snap share) derivable from raw counts, not those advanced metrics.
 """
 import requests
 
-from .db import clean_value, select_all
+from .db import clean_value, fix_team_abbrs, select_all
 
 SLEEPER_TO_NORMALIZED = {
     "pass_cmp": "completions",
@@ -107,6 +107,7 @@ def fetch_nflreadpy(season, week=None):
             stats = stats[stats["week"] == week]
         if stats.empty:
             return []
+        stats = fix_team_abbrs(stats, "team")
         stats = stats.replace([float("inf"), float("-inf")], None)
         stats = stats.where(stats.notnull(), None)
         rows = stats.to_dict(orient="records")
@@ -128,6 +129,60 @@ def _sleeper_crosswalk(supabase):
         if sid is None:
             continue
         out[str(int(float(sid)))] = row
+    return out
+
+
+# Sleeper injury_status values meaning "not on the field this week at all" -
+# confirmed via a live pull of /v1/players/nfl, 2026-09-29: these are the
+# distinct non-"Questionable" statuses in real use that week (IR 241, Out 224,
+# PUP 38, NA 96, Sus 11, COV 2, DNR 2). User, 2026-09-29: "if a player is
+# listed on IR then their share inputs should be 0... clear out those players
+# too" (confirming PUP/Sus/NA belong in the same bucket) - COV/DNR are
+# grouped in by the same reasoning (also clearly not playing), though rare
+# enough they weren't individually confirmed live.
+#
+# "Out" deliberately removed (2026-09-30, user correction after the first
+# real run): unlike IR/PUP/Sus/NA, "Out" is tied to a SPECIFIC game, and
+# there's no confirmed guarantee Sleeper has already rolled it forward to
+# the upcoming week's game by the time this pipeline runs (Tuesday morning) -
+# it could still be reflecting last week's now-finished game. Rather than
+# assume the field means "out for the game we're about to project," it's
+# excluded until that timing is independently confirmed. "Questionable"/
+# "Doubtful" remain deliberately excluded too - those players are still
+# genuinely expected to potentially play, so their normal projected share
+# should stand.
+INACTIVE_WEEKLY_STATUSES = {"IR", "PUP", "Sus", "NA", "COV", "DNR"}
+
+
+def get_inactive_weekly_gsis_ids(supabase):
+    """
+    {gsis_id} for every player Sleeper currently lists with a status in
+    INACTIVE_WEEKLY_STATUSES - i.e., not expected to play AT ALL this week.
+
+    Weekly-only by design: this is a snapshot of right now, not a durable
+    fact about the player (someone on IR this week can easily be back in a
+    month) - callers must apply it only inside the weekly pipeline
+    (write_weekly_tables.py), via project_player_week's share_override, never
+    inside compute_player_baseline/compute_player_share_baseline themselves,
+    since write_ros_tables.py also calls those and must not have a player's
+    whole rest-of-season outlook zeroed just because they're out this one week.
+
+    No fallback on failure, matching get_current_week()'s own style - user,
+    2026-09-29: "if it fails then rerun" - a broken/incomplete fetch here
+    should stop the whole pipeline run rather than silently produce a week of
+    projections missing this week's real inactives.
+    """
+    crosswalk = _sleeper_crosswalk(supabase)
+    r = requests.get("https://api.sleeper.app/v1/players/nfl", timeout=30)
+    r.raise_for_status()
+    players = r.json()
+    out = set()
+    for sleeper_id, p in players.items():
+        if p.get("injury_status") not in INACTIVE_WEEKLY_STATUSES:
+            continue
+        row = crosswalk.get(sleeper_id)
+        if row and row.get("gsis_id"):
+            out.add(row["gsis_id"])
     return out
 
 

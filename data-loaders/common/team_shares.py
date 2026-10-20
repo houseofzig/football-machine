@@ -20,7 +20,7 @@ production instead of not existing at all.
 from .matchup import compute_player_share_baseline
 
 
-def normalize_team_shares(supabase, team, players, season, week):
+def normalize_team_shares(supabase, team, players, season, week, saved_ros_weight=None, exclude_ids=None):
     """
     players: list of {"player_id", "player_name", "position", "slot_key"} for
     every player on this team being projected. Returns {player_name:
@@ -28,17 +28,23 @@ def normalize_team_shares(supabase, team, players, season, week):
     across the team (only among players who actually carry/target - QB
     carry_share and RB/WR/TE target_share both count toward pools, matching
     how real offenses share touches across positions).
+
+    exclude_ids (weekly only, 2026-10-20): player_ids not playing this week
+    (IR/Out/etc). Left out of the sums, so their share goes to the players who
+    are playing instead of to nobody - they used to count here and then get
+    zeroed afterward, leaving e.g. MIN's active players with ~91% of targets.
     """
     raw = {}
     for p in players:
         is_starter = (p.get("slot_key") or "").endswith("_0")
         raw[p["player_name"]] = compute_player_share_baseline(
             supabase, p["player_id"], p["position"], team, season, week, p["player_name"],
-            is_starter=is_starter,
+            is_starter=is_starter, saved_ros_weight=saved_ros_weight,
         )
 
-    carry_sum = sum((s.get("carry_share") or 0) for s in raw.values())
-    target_sum = sum((s.get("target_share") or 0) for s in raw.values())
+    excluded = {p["player_name"] for p in players if exclude_ids and p["player_id"] in exclude_ids}
+    carry_sum = sum((s.get("carry_share") or 0) for n, s in raw.items() if n not in excluded)
+    target_sum = sum((s.get("target_share") or 0) for n, s in raw.items() if n not in excluded)
 
     normalized = {}
     for name, s in raw.items():

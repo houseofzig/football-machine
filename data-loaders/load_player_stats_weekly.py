@@ -18,7 +18,7 @@ import argparse
 
 import nflreadpy as nfl
 
-from common.db import CURRENT_SEASON, clean_rows, get_client, upsert_batched
+from common.db import CURRENT_SEASON, clean_rows, fix_team_abbrs, get_client, upsert_batched
 from common.sources import get_current_week, get_weekly_player_stats
 
 ON_CONFLICT = "player_id,season,week"
@@ -30,6 +30,7 @@ def backfill(supabase):
         seasons=list(range(1999, CURRENT_SEASON + 1)), summary_level="week"
     ).to_pandas()
     stats = stats[stats["position"].isin(["QB", "RB", "WR", "TE"])]
+    stats = fix_team_abbrs(stats, "team")
     stats = stats.replace([float("inf"), float("-inf")], None)
     stats = stats.where(stats.notnull(), None)
     rows = clean_rows(stats.to_dict(orient="records"))
