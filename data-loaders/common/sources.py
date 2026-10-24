@@ -154,10 +154,17 @@ def _sleeper_crosswalk(supabase):
 INACTIVE_WEEKLY_STATUSES = {"IR", "PUP", "Sus", "NA", "COV", "DNR"}
 
 
-def get_inactive_weekly_gsis_ids(supabase):
+# ROS team-share scaling (2026-10-22, user: "IR players you can leave out"): only
+# the multi-week statuses. Sleeper's "Out" is not in INACTIVE_WEEKLY_STATUSES at
+# all, and NA/COV/DNR are not included here either.
+ROS_LONG_TERM_INACTIVE_STATUSES = {"IR", "PUP", "Sus"}
+
+
+def get_inactive_weekly_gsis_ids(supabase, statuses=None):
     """
     {gsis_id} for every player Sleeper currently lists with a status in
-    INACTIVE_WEEKLY_STATUSES - i.e., not expected to play AT ALL this week.
+    `statuses` (default INACTIVE_WEEKLY_STATUSES) - i.e., not expected to play
+    AT ALL this week. The ROS writer passes ROS_LONG_TERM_INACTIVE_STATUSES.
 
     Weekly-only by design: this is a snapshot of right now, not a durable
     fact about the player (someone on IR this week can easily be back in a
@@ -178,7 +185,7 @@ def get_inactive_weekly_gsis_ids(supabase):
     players = r.json()
     out = set()
     for sleeper_id, p in players.items():
-        if p.get("injury_status") not in INACTIVE_WEEKLY_STATUSES:
+        if p.get("injury_status") not in (statuses if statuses is not None else INACTIVE_WEEKLY_STATUSES):
             continue
         row = crosswalk.get(sleeper_id)
         if row and row.get("gsis_id"):
