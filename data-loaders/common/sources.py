@@ -107,7 +107,7 @@ def fetch_nflreadpy(season, week=None):
             stats = stats[stats["week"] == week]
         if stats.empty:
             return []
-        stats = fix_team_abbrs(stats, "team")
+        stats = fix_team_abbrs(stats, "team", "opponent_team")
         stats = stats.replace([float("inf"), float("-inf")], None)
         stats = stats.where(stats.notnull(), None)
         rows = stats.to_dict(orient="records")

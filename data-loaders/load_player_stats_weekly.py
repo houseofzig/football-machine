@@ -30,7 +30,7 @@ def backfill(supabase):
         seasons=list(range(1999, CURRENT_SEASON + 1)), summary_level="week"
     ).to_pandas()
     stats = stats[stats["position"].isin(["QB", "RB", "WR", "TE"])]
-    stats = fix_team_abbrs(stats, "team")
+    stats = fix_team_abbrs(stats, "team", "opponent_team")
     stats = stats.replace([float("inf"), float("-inf")], None)
     stats = stats.where(stats.notnull(), None)
     rows = clean_rows(stats.to_dict(orient="records"))
