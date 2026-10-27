@@ -44,6 +44,11 @@ RECENT_WINDOW = 4
 # that season is left out of both his shares and his efficiencies - see
 # partial_games. User chose "half his usual snap share".
 PARTIAL_GAME_SNAP_RATIO = 0.5
+# Zero-usage rule (user, 2026-10-27: Simi Fehoko had a 12% Week 8 target share with 0 targets in
+# his last 5 games - the qualifying-game filter hides those games, so his 2024 games and a stale
+# saved ROS row carried the share). A non-QB with a real stat row in each of his last N games this
+# season and zero targets in all of them gets target_share 0; same for carries. Weekly only.
+ZERO_USAGE_GAMES = 5
 QUALIFYING_GAME_THRESHOLD = 4
 # Current-season weight by games played this season (updated 2026-09-16, user
 # request - replaces the old floor+linear-ramp formula since these numbers
@@ -228,6 +233,17 @@ def partial_games(supabase, player_id):
         cutoff = PARTIAL_GAME_SNAP_RATIO * statistics.median(weeks.values())
         out |= {(season, wk) for wk, pct in weeks.items() if pct < cutoff}
     return frozenset(out)
+
+
+def zero_usage(supabase, player_id, season, week):
+    """True when the player's last ZERO_USAGE_GAMES real stat rows this season (team filled in -
+    the stray team=None rows are not games he played; partial games count, he was still on the
+    roster) show zero targets AND zero carries in every one of them."""
+    rows = [g for g in fetch_player_games(supabase, player_id, season, week) if g["season"] == season and g.get("team")]
+    last = rows[-ZERO_USAGE_GAMES:]
+    if len(last) < ZERO_USAGE_GAMES:
+        return False
+    return all((g.get("targets") or 0) == 0 and (g.get("carries") or 0) == 0 for g in last)
 
 
 def fetch_full_games(supabase, player_id, before_season, before_week):
@@ -568,6 +584,12 @@ def compute_player_share_baseline(supabase, player_id, position, team, season, w
             result["pass_attempt_share"] = 1.0 if is_starter else 0.0
             if not is_starter:
                 result["carry_share"] = 0.0
+        elif saved_ros_weight is None:  # weekly only - the ROS model has its own path (ros_model.py)
+            if zero_usage(supabase, player_id, season, week):
+                if result.get("target_share") is not None:
+                    result["target_share"] = 0.0
+                if result.get("carry_share") is not None:
+                    result["carry_share"] = 0.0
         return result
 
     prior_seasons_games = [
